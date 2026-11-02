@@ -12,6 +12,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 from typing import Callable, Optional, TextIO
 
 # lib imports
@@ -25,6 +26,10 @@ from common import definitions
 from common import logger
 
 log = logger.get_logger(name=__name__)
+
+# Each extraction starts a JavaScript runtime that parses the full YouTube player (about 300 MB of memory).
+# Worker threads share one runtime slot so concurrent items cannot multiply that peak; downloads stay parallel.
+_extraction_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -179,6 +184,9 @@ def _error_reason(error: Exception) -> str:
 def _extract_video(url: str, params: dict, on_error: Callable[[str], None] | None = None) -> Optional[dict]:
     """Extract a video or the first available playlist entry.
 
+    Extractions run one at a time across worker threads because yt-dlp solves YouTube's
+    JavaScript challenges in a separate, memory-intensive runtime process.
+
     Parameters
     ----------
     url : str
@@ -195,7 +203,8 @@ def _extract_video(url: str, params: dict, on_error: Callable[[str], None] | Non
     """
     with yt_dlp.YoutubeDL(params=params) as ydl:
         try:
-            result = ydl.extract_info(url=url, download=False)
+            with _extraction_lock:
+                result = ydl.extract_info(url=url, download=False)
         except yt_dlp.utils.ExtractorError as exc:
             if exc.expected:
                 log.info('yt-dlp could not extract %s: %s', url, exc)
