@@ -4,6 +4,7 @@
 from contextlib import nullcontext
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -119,6 +120,71 @@ def test_download_error_is_nonfatal(configured, monkeypatch):
 def test_unexpected_error(configured, monkeypatch):
     extractor(monkeypatch, error=RuntimeError('failed'))
     assert youtube_dl.process_youtube('https://youtube.example') is None
+
+
+def test_concurrent_extractions_share_one_js_runtime_slot(configured, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    state = {
+        'active': 0,
+        'max_active': 0,
+        'calls': 0,
+    }
+    state_lock = threading.Lock()
+
+    class BlockingYDL:
+        def __init__(self, params):
+            self.params = params
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def extract_info(self, url, download):
+            with state_lock:
+                state['active'] += 1
+                state['calls'] += 1
+                state['max_active'] = max(state['max_active'], state['active'])
+            entered.set()
+            release.wait(timeout=5)
+            with state_lock:
+                state['active'] -= 1
+            return {'id': url}
+
+    monkeypatch.setattr(youtube_dl.yt_dlp, 'YoutubeDL', BlockingYDL)
+    results = []
+    workers = [
+        threading.Thread(target=lambda url=url: results.append(youtube_dl._extract_video(url, {})))
+        for url in (
+            'https://youtube.example/first',
+            'https://youtube.example/second',
+        )
+    ]
+    workers[0].start()
+    assert entered.wait(timeout=5)
+    workers[1].start()
+    workers[1].join(timeout=0.2)
+    assert workers[1].is_alive()
+    assert state['calls'] == 1
+
+    release.set()
+    for worker in workers:
+        worker.join(timeout=5)
+    assert not any(worker.is_alive() for worker in workers)
+    assert state['calls'] == 2
+    assert state['max_active'] == 1
+    assert sorted(result['id'] for result in results) == [
+        'https://youtube.example/first',
+        'https://youtube.example/second',
+    ]
+
+
+def test_failed_extraction_releases_js_runtime_slot(configured, monkeypatch):
+    extractor(monkeypatch, error=youtube_dl.yt_dlp.utils.DownloadError('ERROR: Video unavailable'))
+    assert youtube_dl.process_youtube('https://youtube.example') is None
+    assert not youtube_dl._extraction_lock.locked()
 
 
 def test_ns_bool():
